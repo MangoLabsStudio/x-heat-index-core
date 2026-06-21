@@ -84,6 +84,7 @@ def paid_graph_audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
         return {"status": "missing_audit", "path": str(audit_path), "status_counts": {}}
     audit = load_json_object(audit_path)
     counts = audit.get("status_counts") if isinstance(audit.get("status_counts"), dict) else {}
+    legacy_counts = audit.get("legacy_status_counts") if isinstance(audit.get("legacy_status_counts"), dict) else {}
     audit_mtime = audit_path.stat().st_mtime_ns
     input_mtime = 0
     for path in (
@@ -97,8 +98,20 @@ def paid_graph_audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
         except OSError:
             continue
     stale = input_mtime > audit_mtime
-    missing = int(counts.get("missing") or 0)
-    seeded = int(counts.get("seeded") or 0)
+    missing = int(counts.get("fetch_failed") or counts.get("missing") or legacy_counts.get("missing") or 0)
+    seeded = int(counts.get("seeded_pending_metric_fetch") or counts.get("seeded") or legacy_counts.get("seeded") or 0)
+    matched = int(counts.get("matched_observed") or counts.get("matched") or legacy_counts.get("matched") or 0)
+    paid_rows = audit.get("paid_deliverables") if isinstance(audit.get("paid_deliverables"), list) else []
+    failed_tweet_ids = [
+        str(row.get("tweet_id") or "")
+        for row in paid_rows
+        if str(row.get("graph_match_status") or "") in {"fetch_failed", "missing"}
+    ]
+    seeded_tweet_ids = [
+        str(row.get("tweet_id") or "")
+        for row in paid_rows
+        if str(row.get("graph_match_status") or "") in {"seeded_pending_metric_fetch", "seeded"}
+    ]
     if stale:
         status = "stale"
     elif missing:
@@ -110,10 +123,13 @@ def paid_graph_audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
     return {
         "status": status,
         "status_counts": counts,
+        "legacy_status_counts": legacy_counts,
         "paid_deliverable_count": audit.get("paid_deliverable_count", 0),
-        "matched_roots": int(counts.get("matched") or 0),
-        "missing_roots": int(counts.get("missing") or 0),
-        "seed_only_roots": int(counts.get("seeded") or 0),
+        "matched_roots": matched,
+        "missing_roots": missing,
+        "seed_only_roots": seeded,
+        "failed_tweet_ids": [tid for tid in failed_tweet_ids if tid],
+        "seeded_tweet_ids": [tid for tid in seeded_tweet_ids if tid],
         "updated_at": audit.get("updated_at") or audit.get("generated_at"),
         "source_snapshot_id": audit.get("run_id") or audit.get("source_snapshot_id"),
         "audit_stale": stale,
@@ -199,6 +215,14 @@ def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
     )[:20]
 
     paid_audit = paid_graph_audit(config_path, nodes_path)
+    paid_total = int(paid_audit.get("paid_deliverable_count") or 0)
+    collection_completeness = {
+        "paid_root_coverage": round(float(paid_audit.get("matched_roots") or 0) / paid_total, 3) if paid_total else 1.0,
+        "reply_page_coverage": None,
+        "quote_page_coverage": None,
+        "tracker_coverage": None,
+        "cascade_coverage": None,
+    }
     risks: list[str] = []
     missing_handles = [
         handle for handle, row in per_watch.items()
@@ -222,6 +246,8 @@ def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
         risks.append("paid graph match audit is stale")
     elif paid_audit["status"] in {"not_ready", "estimate_only"}:
         risks.append(f"paid graph readiness is {paid_audit['status']}: {paid_audit.get('status_counts', {})}")
+        if paid_audit.get("failed_tweet_ids"):
+            risks.append(f"paid root fetch failed: {', '.join(paid_audit['failed_tweet_ids'][:20])}")
 
     return {
         "campaign_id": config.get("campaign_id"),
@@ -244,6 +270,7 @@ def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
             "article_enrichment_gaps": len(article_enrichment_gaps),
         },
         "paid_graph_readiness": paid_audit,
+        "collection_completeness": collection_completeness,
         "per_watch_handle": per_watch,
         "top_noise_candidates": [
             {

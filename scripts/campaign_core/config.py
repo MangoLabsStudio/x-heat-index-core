@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from .identity import normalize_handle, unique_strings
+from .paid import normalize_paid_deliverable
 from .timeutils import parse_iso_utc
 
 
@@ -84,5 +85,16 @@ def validate_campaign_config(config: dict[str, Any], campaign_id: str = "") -> l
     overlap = set(watch_handles) & set(official_handles)
     if overlap:
         errors.append(f"handles cannot be both watch and official: {', '.join(sorted(overlap))}")
+
+    paid_rows = config.get("paid_deliverables")
+    if paid_rows is not None:
+        if not isinstance(paid_rows, list):
+            errors.append("paid_deliverables must be a list when present")
+        else:
+            for index, row in enumerate(paid_rows):
+                normalized = normalize_paid_deliverable(row, source="config")
+                reason = normalized.get("diagnostic_reason")
+                if reason in {"missing_tweet_id", "missing_author"}:
+                    errors.append(f"paid_deliverables[{index}] invalid: {reason}")
 
     return errors

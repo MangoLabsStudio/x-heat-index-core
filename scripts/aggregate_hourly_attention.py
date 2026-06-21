@@ -35,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 
 from campaign_core.identity import has_identity_signal, node_conversation_id
-from campaign_core.metrics import metrics_view_count, safe_float, should_replace_observation
+from campaign_core.metrics import evidence_status, metric_status, metrics_view_count, safe_float, should_replace_observation
 from campaign_core.paid import PAID_DELIVERABLE_SEED_SOURCE, PAID_DELIVERABLE_TRACKER_SOURCE, normalize_paid_source
 from campaign_core.timeutils import hour_bucket, parse_iso_utc, parse_twitter_created_at
 
@@ -91,10 +91,20 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
     # Aggregate
     bucket_stats: dict[str, dict] = defaultdict(lambda: {
         "attention_mass": 0.0,
+        "attention_mass_observed": 0.0,
+        "attention_mass_estimated": 0.0,
+        "attention_mass_pending": 0.0,
         "node_count": 0,
+        "observed_node_count": 0,
+        "estimated_node_count": 0,
+        "pending_node_count": 0,
         "views_sum": 0,
+        "views_observed_sum": 0,
+        "views_estimated_sum": 0,
+        "views_pending_sum": 0,
         "affinity_sum": 0.0,
         "by_source": defaultdict(int),
+        "exclusion_reasons": defaultdict(int),
     })
 
     # Pass 1: find conversations that contain at least one signaled node
@@ -144,12 +154,28 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
         affinity = safe_float(node.get("campaign_affinity"))
 
         s = bucket_stats[hour]
-        s["attention_mass"] += views * affinity
+        attention = views * affinity
+        status = metric_status(node)
+        evidence = evidence_status(node)
+        evidence_bucket = source
+        if source in {PAID_DELIVERABLE_SEED_SOURCE, PAID_DELIVERABLE_TRACKER_SOURCE} and status == "pending_metric_fetch":
+            evidence_bucket = "paid_seed_pending"
+            s["attention_mass_pending"] += attention
+            s["pending_node_count"] += 1
+            s["views_pending_sum"] += views
+        elif source in {PAID_DELIVERABLE_SEED_SOURCE, PAID_DELIVERABLE_TRACKER_SOURCE} and (status == "seed_metric" or evidence == "seeded"):
+            evidence_bucket = "paid_seed_estimate"
+            s["attention_mass_estimated"] += attention
+            s["estimated_node_count"] += 1
+            s["views_estimated_sum"] += views
+        else:
+            s["attention_mass_observed"] += attention
+            s["observed_node_count"] += 1
+            s["views_observed_sum"] += views
+        s["attention_mass"] += attention
         s["node_count"] += 1
         s["views_sum"] += views
         s["affinity_sum"] += affinity
-        metric_status = str(node.get("metric_status") or "").strip().lower()
-        evidence_bucket = "paid_seed_estimate" if source in {PAID_DELIVERABLE_SEED_SOURCE, PAID_DELIVERABLE_TRACKER_SOURCE} and metric_status in {"seed_metric", "pending_metric_fetch"} else source
         s["by_source"][evidence_bucket] += 1
 
     rows = []
@@ -158,10 +184,21 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
         rows.append({
             "hour_utc": hour,
             "attention_mass": round(s["attention_mass"], 2),
+            "attention_mass_observed": round(s["attention_mass_observed"], 2),
+            "attention_mass_estimated": round(s["attention_mass_estimated"], 2),
+            "attention_mass_pending": round(s["attention_mass_pending"], 2),
             "node_count": s["node_count"],
+            "observed_node_count": s["observed_node_count"],
+            "estimated_node_count": s["estimated_node_count"],
+            "pending_node_count": s["pending_node_count"],
             "views_sum": s["views_sum"],
+            "views_observed_sum": s["views_observed_sum"],
+            "views_estimated_sum": s["views_estimated_sum"],
+            "views_pending_sum": s["views_pending_sum"],
             "avg_affinity": round(s["affinity_sum"] / s["node_count"], 3) if s["node_count"] else 0.0,
+            "metric_completeness": round(s["observed_node_count"] / s["node_count"], 3) if s["node_count"] else 0.0,
             "by_source": dict(s["by_source"]),
+            "exclusion_reasons": dict(s["exclusion_reasons"]),
         })
 
     stats = {
@@ -179,6 +216,13 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
         "hour_buckets": len(rows),
         "hour_range": (rows[0]["hour_utc"], rows[-1]["hour_utc"]) if rows else None,
         "total_attention_mass": round(sum(r["attention_mass"] for r in rows), 2),
+        "total_attention_mass_observed": round(sum(r["attention_mass_observed"] for r in rows), 2),
+        "total_attention_mass_estimated": round(sum(r["attention_mass_estimated"] for r in rows), 2),
+        "total_attention_mass_pending": round(sum(r["attention_mass_pending"] for r in rows), 2),
+        "metric_completeness": round(
+            sum(r["observed_node_count"] for r in rows) / sum(r["node_count"] for r in rows),
+            3,
+        ) if rows and sum(r["node_count"] for r in rows) else 0.0,
     }
     return rows, stats
 

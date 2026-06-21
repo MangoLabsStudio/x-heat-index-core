@@ -653,6 +653,8 @@ class IdentityCollector:
                 self.best_existing[tid] = row
 
         self.best_run: dict[str, dict] = {}
+        self.paid_root_errors: dict[str, str] = {}
+        self.related_page_diagnostics: dict[str, dict[str, dict]] = {}
         self.matched_tweet_ids: set[str] = set()
         self.matched_conversation_ids: set[str] = set()
         self.known_campaign_authors: set[str] = set()
@@ -735,12 +737,27 @@ class IdentityCollector:
             threshold = min(threshold, 0.62)
         if affinity < threshold:
             return
+        tid = str(tweet.get("tweet_id") or tweet.get("node_id") or "").strip()
+        if not tid:
+            return
+        relation_type = relation or "root"
+        is_paid_root = source_kind == "paid_deliverable_seed"
+        is_paid_related = bool(parent_tweet_id and parent_tweet_id in set(self.cfg.paid_tweet_ids) and relation in {"reply", "quote"})
         row = {
             **tweet,
             "campaign_affinity": affinity,
             "affinity_reason": reasons,
             "collector_version": "identity_first_v2",
             "source": source_kind,
+            "node_role": (
+                "paid_root" if is_paid_root
+                else f"paid_{relation}" if is_paid_related
+                else relation or "organic_node"
+            ),
+            "origin_root_tweet_id": parent_tweet_id or (tid if is_paid_root else ""),
+            "relation_type": relation_type,
+            "metric_status": str(tweet.get("metric_status") or "observed"),
+            "evidence_status": str(tweet.get("evidence_status") or "observed"),
             "source_meta": {
                 "kind": source_kind,
                 "query": source_query,
@@ -770,12 +787,16 @@ class IdentityCollector:
             try:
                 payload = self.client.fetch_tweet(tid)
             except Exception as exc:
-                self.summary["errors"].append(f"paid root fetch {tid}: {exc}")
+                message = f"paid root fetch {tid}: {exc}"
+                self.paid_root_errors[tid] = message
+                self.summary["errors"].append(message)
                 continue
             tweets = extract_tweets(payload)
             root = next((tweet for tweet in tweets if str(tweet.get("tweet_id") or "") == tid), tweets[0] if tweets else None)
             if not root:
-                self.summary["errors"].append(f"paid root fetch {tid}: no tweet node returned")
+                message = f"paid root fetch {tid}: no tweet node returned"
+                self.paid_root_errors[tid] = message
+                self.summary["errors"].append(message)
                 continue
             self.summary["paid_root_fetch_found"] += 1
             self._maybe_add(root, source_kind="paid_deliverable_seed")
@@ -897,14 +918,24 @@ class IdentityCollector:
                 ("quote", "quotes", self.client.fetch_quotes, self.cfg.quote_pages),
             ):
                 cursor = ""
+                page_count = 0
+                stop_reason = "page_cap_reached" if page_limit > 0 else "disabled"
+                repeated_cursor = False
+                endpoint_error = ""
+                rate_limit = False
                 for _page in range(page_limit):
                     if self._deadline_exceeded("reply_quote_expand"):
+                        stop_reason = "deadline_exceeded"
                         return
                     try:
                         payload = fetcher(tid, self.cfg.related_count, cursor)
                     except Exception as exc:
+                        endpoint_error = str(exc)
+                        rate_limit = "429" in endpoint_error or "rate" in endpoint_error.lower()
+                        stop_reason = "rate_limit" if rate_limit else "endpoint_error"
                         self.summary["errors"].append(f"{relation} expand {tid}: {exc}")
                         break
+                    page_count += 1
                     tweets = extract_tweets(payload)
                     self.summary["expanded_related_candidates"] += len(tweets)
                     for tweet in tweets:
@@ -919,9 +950,22 @@ class IdentityCollector:
                                 continue
                         self._maybe_add(tweet, source_kind=f"matched_{relation_label}", parent_tweet_id=tid, relation=relation)
                     next_cursor = extract_bottom_cursor(payload)
-                    if not next_cursor or next_cursor == cursor:
+                    if not next_cursor:
+                        stop_reason = "no_next_cursor"
+                        break
+                    if next_cursor == cursor:
+                        repeated_cursor = True
+                        stop_reason = "repeated_cursor"
                         break
                     cursor = next_cursor
+                self.related_page_diagnostics.setdefault(tid, {})[relation] = {
+                    "page_count": page_count,
+                    "cursor_stop_reason": stop_reason,
+                    "page_cap_reached": stop_reason == "page_cap_reached",
+                    "repeated_cursor": repeated_cursor,
+                    "rate_limit": rate_limit,
+                    "endpoint_error": endpoint_error,
+                }
 
     def _paid_graph_match_audit(self) -> list[dict]:
         rows_by_id = self._all_rows_by_tweet_id()
@@ -929,15 +973,25 @@ class IdentityCollector:
         for tid in self.cfg.paid_tweet_ids:
             row = rows_by_id.get(tid)
             if not row:
-                status = "missing"
+                status = "fetch_failed" if tid in self.paid_root_errors else "fetch_failed"
+                legacy_status = "missing"
                 evidence_level = "missing"
                 metrics = {}
                 observed_at = ""
                 source = ""
+                metric_status_value = "fetch_failed"
+                evidence_status_value = "failed"
             else:
                 metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
                 source = normalize_paid_source(row.get("source") or "")
-                status = "matched"
+                metric_status_value = str(row.get("metric_status") or "").strip().lower()
+                evidence_status_value = str(row.get("evidence_status") or "").strip().lower()
+                if metric_status_value in {"seed_metric", "pending_metric_fetch"} or evidence_status_value == "seeded":
+                    status = "seeded_pending_metric_fetch"
+                    legacy_status = "seeded"
+                else:
+                    status = "matched_observed"
+                    legacy_status = "matched"
                 evidence_level = "root_observed"
                 observed_at = str(row.get("fetched_at") or row.get("observed_at") or "")
             children = [
@@ -952,11 +1006,16 @@ class IdentityCollector:
                     "campaign_id": self.cfg.campaign_id,
                     "tweet_id": tid,
                     "graph_match_status": status,
+                    "legacy_graph_match_status": legacy_status,
                     "evidence_level": evidence_level,
                     "source": source,
+                    "metric_status": metric_status_value,
+                    "evidence_status": evidence_status_value,
+                    "diagnostic_reason": self.paid_root_errors.get(tid, ""),
                     "collected_at": self.started_at,
                     "observed_at": observed_at,
                     "source_snapshot_id": self.run_id,
+                    "collection_diagnostics": self.related_page_diagnostics.get(tid, {}),
                     "reply_quote_coverage": {
                         "reply_nodes": reply_count,
                         "quote_nodes": quote_count,
@@ -969,13 +1028,22 @@ class IdentityCollector:
 
     def _write_paid_graph_match_audit(self) -> None:
         audit_rows = self._paid_graph_match_audit()
-        counts = {"matched": 0, "seeded": 0, "missing": 0}
+        counts = {
+            "matched_observed": 0,
+            "seeded_pending_metric_fetch": 0,
+            "fetch_failed": 0,
+            "invalid_manifest_row": 0,
+            "filtered_by_window": 0,
+        }
+        legacy_counts = {"matched": 0, "seeded": 0, "missing": 0}
         for row in audit_rows:
-            status = str(row.get("graph_match_status") or "missing")
+            status = str(row.get("graph_match_status") or "fetch_failed")
             counts[status] = counts.get(status, 0) + 1
-        self.summary["paid_graph_matched_count"] = counts.get("matched", 0)
-        self.summary["paid_seeded_count"] = counts.get("seeded", 0)
-        self.summary["paid_missing_count"] = counts.get("missing", 0)
+            legacy_status = str(row.get("legacy_graph_match_status") or "missing")
+            legacy_counts[legacy_status] = legacy_counts.get(legacy_status, 0) + 1
+        self.summary["paid_graph_matched_count"] = counts.get("matched_observed", 0)
+        self.summary["paid_seeded_count"] = counts.get("seeded_pending_metric_fetch", 0)
+        self.summary["paid_missing_count"] = counts.get("fetch_failed", 0)
         atomic_write_json(
             self.paid_audit_path,
             {
@@ -985,6 +1053,7 @@ class IdentityCollector:
                 "updated_at": now_iso(),
                 "paid_deliverable_count": len(self.cfg.paid_tweet_ids),
                 "status_counts": counts,
+                "legacy_status_counts": legacy_counts,
                 "paid_deliverables": audit_rows,
             },
         )
