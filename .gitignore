@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+._*
+*.swp
+*.bak
+*.tmp
+*.log
+
+# Local data — never commit (contains tweet content + author handles)
+data/
+
+# Local env override (should never have real secrets)
+.env
+
+# Claim-runtime artifacts (per-clone, not source-controlled)
+.claim-proof.log
+.claim-proof.log.legacy-*
+.claude/settings.local.json
+
+# Static frontend build output (Vercel)
+frontend/dist/
+.vercel
