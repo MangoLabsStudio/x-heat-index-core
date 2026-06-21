@@ -184,6 +184,7 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
         rows.append({
             "hour_utc": hour,
             "attention_mass": round(s["attention_mass"], 2),
+            "attention_mass_total_including_estimates": round(s["attention_mass"], 2),
             "attention_mass_observed": round(s["attention_mass_observed"], 2),
             "attention_mass_estimated": round(s["attention_mass_estimated"], 2),
             "attention_mass_pending": round(s["attention_mass_pending"], 2),
@@ -197,6 +198,8 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
             "views_pending_sum": s["views_pending_sum"],
             "avg_affinity": round(s["affinity_sum"] / s["node_count"], 3) if s["node_count"] else 0.0,
             "metric_completeness": round(s["observed_node_count"] / s["node_count"], 3) if s["node_count"] else 0.0,
+            "aggregation_ready": s["pending_node_count"] == 0,
+            "readiness": "partial" if s["pending_node_count"] else "ready",
             "by_source": dict(s["by_source"]),
             "exclusion_reasons": dict(s["exclusion_reasons"]),
         })
@@ -216,9 +219,12 @@ def aggregate(nodes_path: Path, since: datetime | None = None, until: datetime |
         "hour_buckets": len(rows),
         "hour_range": (rows[0]["hour_utc"], rows[-1]["hour_utc"]) if rows else None,
         "total_attention_mass": round(sum(r["attention_mass"] for r in rows), 2),
+        "total_attention_mass_total_including_estimates": round(sum(r["attention_mass_total_including_estimates"] for r in rows), 2),
         "total_attention_mass_observed": round(sum(r["attention_mass_observed"] for r in rows), 2),
         "total_attention_mass_estimated": round(sum(r["attention_mass_estimated"] for r in rows), 2),
         "total_attention_mass_pending": round(sum(r["attention_mass_pending"] for r in rows), 2),
+        "aggregation_ready": all(r["aggregation_ready"] for r in rows),
+        "readiness": "partial" if any(not r["aggregation_ready"] for r in rows) else "ready",
         "metric_completeness": round(
             sum(r["observed_node_count"] for r in rows) / sum(r["node_count"] for r in rows),
             3,

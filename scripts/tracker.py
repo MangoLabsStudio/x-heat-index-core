@@ -31,6 +31,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from campaign_core.collection_state import append_collection_event
 from tracking_schedule import age_seconds, format_duration, load_tracker_policy
 
 # Hard socket timeout
@@ -47,6 +48,8 @@ TWEET_ID = os.environ["TWEET_ID"]
 _active_key = KEY_PRIMARY
 _using_fallback = False
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
+CAMPAIGN_ID = os.environ.get("CAMPAIGN_ID", "").strip()
+XHI_CAMPAIGN_DIR = os.environ.get("XHI_CAMPAIGN_DIR", "").strip()
 TRACKING_POLICY = load_tracker_policy(os.environ)
 TRACKER_ONESHOT = os.environ.get("TRACKER_ONESHOT", "0").strip().lower() in {"1", "true", "yes"}
 
@@ -61,6 +64,29 @@ ERRORS_FILE = TWEET_DIR / "tracker_errors.jsonl"
 STATE_FILE = TWEET_DIR / "state.json"
 CONFIG_FILE = TWEET_DIR / "config.json"
 DASHBOARD_FILE = TWEET_DIR / "dashboard.txt"
+
+
+def campaign_dir() -> Path | None:
+    if XHI_CAMPAIGN_DIR:
+        return Path(XHI_CAMPAIGN_DIR)
+    if CAMPAIGN_ID:
+        return DATA_DIR / "campaign_graphs" / CAMPAIGN_ID
+    return None
+
+
+def emit_collection_event(event: str, **fields) -> None:
+    cdir = campaign_dir()
+    if cdir is None:
+        return
+    append_collection_event(
+        cdir,
+        {
+            "event": event,
+            "campaign_id": CAMPAIGN_ID or cdir.name,
+            "tweet_id": TWEET_ID,
+            **fields,
+        },
+    )
 
 # ──────────────────────────────────────────────────────────────
 # XHI™ Signal Weight Framework v2
@@ -667,6 +693,13 @@ def cycle(state, cfg, phase):
             "error_type": exc.__class__.__name__,
             "error": str(exc),
         })
+        emit_collection_event(
+            "tracker_root_fetch_failed",
+            endpoint="tweet",
+            status="endpoint_failed",
+            error_type=exc.__class__.__name__,
+            error=str(exc),
+        )
         print(f"[{ts}] WARN: root metrics failed for {TWEET_ID}: {exc.__class__.__name__}: {exc}", flush=True)
         return
     if not metrics:
@@ -677,6 +710,12 @@ def cycle(state, cfg, phase):
             "status": "root_metric_unavailable",
             "error": "tweet payload did not contain the requested root tweet",
         })
+        emit_collection_event(
+            "tracker_root_fetch_failed",
+            endpoint="tweet",
+            status="fetch_failed",
+            error="tweet payload did not contain the requested root tweet",
+        )
         print(f"[{ts}] WARN: root metrics unavailable for {TWEET_ID}; skipping", flush=True)
         return
     metrics["ts"] = ts
@@ -690,6 +729,14 @@ def cycle(state, cfg, phase):
         try:
             tweets, next_cursor = fetch_replies_page(cursor)
         except Exception as e:
+            emit_collection_event(
+                "tracker_reply_page_failed",
+                endpoint="comments",
+                relation="reply",
+                status="endpoint_failed",
+                page=page + 1,
+                error=str(e),
+            )
             print(f"[{ts}] WARN: replies page={page}: {e}", flush=True)
             break
         if not tweets:
@@ -718,6 +765,14 @@ def cycle(state, cfg, phase):
         try:
             tweets, next_cursor = fetch_quotes_page(cursor)
         except Exception as e:
+            emit_collection_event(
+                "tracker_quote_page_failed",
+                endpoint="quotes",
+                relation="quote",
+                status="endpoint_failed",
+                page=page + 1,
+                error=str(e),
+            )
             print(f"[{ts}] WARN: quotes page={page}: {e}", flush=True)
             break
         if not tweets:

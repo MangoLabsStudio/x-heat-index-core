@@ -35,6 +35,12 @@ from pathlib import Path
 from typing import Any
 
 from campaign_core.config import list_config_strings
+from campaign_core.collection_state import (
+    append_collection_event,
+    collection_job,
+    write_collection_jobs,
+    write_collection_state,
+)
 from campaign_core.identity import is_article_url, normalize_handle, term_in_text, unique_strings
 from campaign_core.io import atomic_write_json, atomic_write_jsonl, load_json_object, load_jsonl
 from campaign_core.metrics import safe_float, safe_int, should_replace_observation
@@ -655,6 +661,15 @@ class IdentityCollector:
         self.best_run: dict[str, dict] = {}
         self.paid_root_errors: dict[str, str] = {}
         self.related_page_diagnostics: dict[str, dict[str, dict]] = {}
+        self.collection_jobs: dict[str, dict] = {
+            tid: collection_job(
+                campaign_id=self.cfg.campaign_id,
+                tweet_id=tid,
+                role="paid_root",
+                source="paid_manifest",
+            )
+            for tid in self.cfg.paid_tweet_ids
+        }
         self.matched_tweet_ids: set[str] = set()
         self.matched_conversation_ids: set[str] = set()
         self.known_campaign_authors: set[str] = set()
@@ -705,6 +720,25 @@ class IdentityCollector:
         author = normalize_handle(row.get("author") or "")
         if author:
             self.known_campaign_authors.add(author)
+
+    def _collection_event(self, event: str, **fields: Any) -> None:
+        append_collection_event(
+            self.campaign_dir,
+            {
+                "event": event,
+                "campaign_id": self.cfg.campaign_id,
+                "run_id": self.run_id,
+                **fields,
+            },
+        )
+
+    def _set_collection_job_status(self, tid: str, status: str, **fields: Any) -> None:
+        job = self.collection_jobs.get(tid)
+        if not job:
+            return
+        job.update(fields)
+        job["status"] = status
+        job["updated_at"] = now_iso()
 
     def _deadline_exceeded(self, phase: str) -> bool:
         if self.deadline_monotonic is None or time.monotonic() <= self.deadline_monotonic:
@@ -782,14 +816,37 @@ class IdentityCollector:
                 return
             if tid in rows_by_id:
                 self._register_match(rows_by_id[tid])
+                self._set_collection_job_status(tid, "observed", root_fetch_status="existing_observed")
+                self._collection_event(
+                    "paid_root_existing_observed",
+                    tweet_id=tid,
+                    role="paid_root",
+                    status="observed",
+                )
                 continue
             self.summary["paid_root_fetch_attempts"] += 1
+            self._collection_event(
+                "paid_root_fetch_started",
+                tweet_id=tid,
+                role="paid_root",
+                endpoint="tweet",
+                status="started",
+            )
             try:
                 payload = self.client.fetch_tweet(tid)
             except Exception as exc:
                 message = f"paid root fetch {tid}: {exc}"
                 self.paid_root_errors[tid] = message
                 self.summary["errors"].append(message)
+                self._set_collection_job_status(tid, "fetch_failed", root_fetch_status="fetch_failed")
+                self._collection_event(
+                    "root_fetch_failed",
+                    tweet_id=tid,
+                    role="paid_root",
+                    endpoint="tweet",
+                    status="fetch_failed",
+                    error=str(exc),
+                )
                 continue
             tweets = extract_tweets(payload)
             root = next((tweet for tweet in tweets if str(tweet.get("tweet_id") or "") == tid), tweets[0] if tweets else None)
@@ -797,10 +854,38 @@ class IdentityCollector:
                 message = f"paid root fetch {tid}: no tweet node returned"
                 self.paid_root_errors[tid] = message
                 self.summary["errors"].append(message)
+                self._set_collection_job_status(tid, "fetch_failed", root_fetch_status="fetch_failed")
+                self._collection_event(
+                    "root_fetch_failed",
+                    tweet_id=tid,
+                    role="paid_root",
+                    endpoint="tweet",
+                    status="fetch_failed",
+                    error="no tweet node returned",
+                )
                 continue
             self.summary["paid_root_fetch_found"] += 1
             self._maybe_add(root, source_kind="paid_deliverable_seed")
             rows_by_id = self._all_rows_by_tweet_id()
+            if tid in rows_by_id:
+                self._set_collection_job_status(tid, "observed", root_fetch_status="observed")
+                self._collection_event(
+                    "paid_root_fetch_succeeded",
+                    tweet_id=tid,
+                    role="paid_root",
+                    endpoint="tweet",
+                    status="observed",
+                )
+            else:
+                self._set_collection_job_status(tid, "seeded_pending_metric_fetch", root_fetch_status="seeded_pending_metric_fetch")
+                self._collection_event(
+                    "paid_root_seeded_pending_metric_fetch",
+                    tweet_id=tid,
+                    role="paid_root",
+                    endpoint="tweet",
+                    status="seeded_pending_metric_fetch",
+                    error="tweet fetched but graph row was not accepted",
+                )
 
     def _resolve_user_id(self, handle: str) -> str:
         handle = normalize_handle(handle)
@@ -934,6 +1019,16 @@ class IdentityCollector:
                         rate_limit = "429" in endpoint_error or "rate" in endpoint_error.lower()
                         stop_reason = "rate_limit" if rate_limit else "endpoint_error"
                         self.summary["errors"].append(f"{relation} expand {tid}: {exc}")
+                        self._collection_event(
+                            f"{relation}_page_failed",
+                            tweet_id=tid,
+                            role="paid_root" if tid in set(self.cfg.paid_tweet_ids) else "graph_root",
+                            relation=relation,
+                            endpoint=relation_label,
+                            status="rate_limit" if rate_limit else "endpoint_failed",
+                            error=endpoint_error,
+                            page=page_count + 1,
+                        )
                         break
                     page_count += 1
                     tweets = extract_tweets(payload)
@@ -966,6 +1061,23 @@ class IdentityCollector:
                     "rate_limit": rate_limit,
                     "endpoint_error": endpoint_error,
                 }
+                if tid in self.collection_jobs:
+                    field = "reply_collection_status" if relation == "reply" else "quote_collection_status"
+                    self.collection_jobs[tid][field] = stop_reason
+                    self.collection_jobs[tid]["updated_at"] = now_iso()
+                self._collection_event(
+                    f"{relation}_collection_completed",
+                    tweet_id=tid,
+                    role="paid_root" if tid in set(self.cfg.paid_tweet_ids) else "graph_root",
+                    relation=relation,
+                    endpoint=relation_label,
+                    status=stop_reason,
+                    page_count=page_count,
+                    page_cap_reached=stop_reason == "page_cap_reached",
+                    repeated_cursor=repeated_cursor,
+                    rate_limit=rate_limit,
+                    error=endpoint_error,
+                )
 
     def _paid_graph_match_audit(self) -> list[dict]:
         rows_by_id = self._all_rows_by_tweet_id()
@@ -1189,6 +1301,15 @@ class IdentityCollector:
         self.summary["written_rows"] = len(rows_to_write)
 
     def _write_state(self, status: str = "succeeded", error: str = "") -> None:
+        jobs = list(self.collection_jobs.values())
+        write_collection_jobs(self.campaign_dir, jobs)
+        collection_state = write_collection_state(
+            self.campaign_dir,
+            campaign_id=self.cfg.campaign_id,
+            run_id=self.run_id,
+            jobs=jobs,
+            status=status,
+        )
         state = {
             "collector_version": "identity_first_v2",
             "run_id": self.run_id,
@@ -1209,6 +1330,7 @@ class IdentityCollector:
             "deadline_exceeded": bool(self.summary.get("deadline_exceeded")),
             "error": error,
             "summary": self.summary,
+            "collection_state": collection_state,
         }
         if status in {"succeeded", "failed", "timeout"}:
             state["completed_at"] = now_iso()

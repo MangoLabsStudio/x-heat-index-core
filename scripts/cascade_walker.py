@@ -32,6 +32,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+from campaign_core.collection_state import append_collection_event
 from tracking_schedule import age_seconds, format_duration, load_walker_policy
 
 socket.setdefaulttimeout(20)
@@ -44,6 +45,8 @@ KEY_FALLBACK = os.environ.get("TWITTER241_RAPIDAPI_KEY_FALLBACK", "")
 HOST = "twitter241.p.rapidapi.com"
 TWEET_ID = os.environ["TWEET_ID"]
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
+CAMPAIGN_ID = os.environ.get("CAMPAIGN_ID", "").strip()
+XHI_CAMPAIGN_DIR = os.environ.get("XHI_CAMPAIGN_DIR", "").strip()
 TRACKING_POLICY = load_walker_policy(os.environ)
 WALKER_ONESHOT = os.environ.get("WALKER_ONESHOT", "0").strip().lower() in {"1", "true", "yes"}
 try:
@@ -63,6 +66,29 @@ TRACKER_STATE_FILE = TWEET_DIR / "state.json"
 
 _active_key = KEY_PRIMARY
 _using_fallback = False
+
+
+def campaign_dir() -> Path | None:
+    if XHI_CAMPAIGN_DIR:
+        return Path(XHI_CAMPAIGN_DIR)
+    if CAMPAIGN_ID:
+        return DATA_DIR / "campaign_graphs" / CAMPAIGN_ID
+    return None
+
+
+def emit_collection_event(event: str, **fields) -> None:
+    cdir = campaign_dir()
+    if cdir is None:
+        return
+    append_collection_event(
+        cdir,
+        {
+            "event": event,
+            "campaign_id": CAMPAIGN_ID or cdir.name,
+            "tweet_id": TWEET_ID,
+            **fields,
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -196,6 +222,14 @@ def fetch_sub_replies(parent_tid: str) -> list[dict]:
         data = call_api(f"/comments?pid={parent_tid}&count=20")
     except Exception as e:
         print(f"[{now_iso()}] WARN: sub_replies({parent_tid}): {e}", flush=True)
+        emit_collection_event(
+            "cascade_parent_failed",
+            parent_tweet_id=parent_tid,
+            relation="reply",
+            endpoint="comments",
+            status="endpoint_failed",
+            error=str(e),
+        )
         return []
     inst = data.get("result", {}).get("instructions", [])
     return extract_tweets_from_instructions(inst, parent_tid, "reply")
@@ -206,6 +240,14 @@ def fetch_sub_quotes(parent_tid: str) -> list[dict]:
         data = call_api(f"/quotes?pid={parent_tid}&count=20")
     except Exception as e:
         print(f"[{now_iso()}] WARN: sub_quotes({parent_tid}): {e}", flush=True)
+        emit_collection_event(
+            "cascade_parent_failed",
+            parent_tweet_id=parent_tid,
+            relation="quote",
+            endpoint="quotes",
+            status="endpoint_failed",
+            error=str(e),
+        )
         return []
     inst = data.get("result", {}).get("timeline", {}).get("instructions", [])
     return extract_tweets_from_instructions(inst, parent_tid, "quote")

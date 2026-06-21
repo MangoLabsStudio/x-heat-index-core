@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from campaign_core.collection_state import load_collection_events, load_collection_jobs
 from campaign_core.identity import has_identity_signal, is_article_url, normalize_handle, node_conversation_id
 from campaign_core.io import load_json_object
 from campaign_core.metrics import metrics_view_count, safe_float, should_replace_observation
@@ -136,6 +137,70 @@ def paid_graph_audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
     }
 
 
+def collection_diagnostics(config_path: Path, paid_audit: dict[str, Any]) -> dict[str, Any]:
+    campaign_dir = config_path.parent
+    jobs = load_collection_jobs(campaign_dir)
+    events = load_collection_events(campaign_dir)
+    paid_jobs = [job for job in jobs if str(job.get("source") or "") == "paid_manifest"]
+    paid_observed = [
+        job for job in paid_jobs
+        if str(job.get("status") or "") == "observed"
+        or str(job.get("root_fetch_status") or "") in {"observed", "existing_observed"}
+    ]
+    reply_attempted = [
+        job for job in paid_jobs
+        if str(job.get("reply_collection_status") or "") not in {"", "disabled"}
+    ]
+    reply_completed = [
+        job for job in reply_attempted
+        if str(job.get("reply_collection_status") or "") in {"no_next_cursor", "page_cap_reached", "repeated_cursor"}
+    ]
+    quote_attempted = [
+        job for job in paid_jobs
+        if str(job.get("quote_collection_status") or "") not in {"", "disabled"}
+    ]
+    quote_completed = [
+        job for job in quote_attempted
+        if str(job.get("quote_collection_status") or "") in {"no_next_cursor", "page_cap_reached", "repeated_cursor"}
+    ]
+    tracker_events = [event for event in events if str(event.get("event") or "").startswith("tracker_")]
+    cascade_events = [event for event in events if str(event.get("event") or "").startswith("cascade_")]
+    tracker_roots = {str(event.get("tweet_id") or "") for event in tracker_events if event.get("tweet_id")}
+    cascade_roots = {str(event.get("tweet_id") or event.get("parent_tweet_id") or "") for event in cascade_events if event.get("tweet_id") or event.get("parent_tweet_id")}
+    failed_events = [
+        event for event in events
+        if str(event.get("event") or "").endswith("_failed")
+        or str(event.get("status") or "") in {"fetch_failed", "endpoint_failed", "rate_limit"}
+    ]
+    endpoint_failures = [
+        {
+            "tweet_id": event.get("tweet_id") or event.get("parent_tweet_id") or "",
+            "endpoint": event.get("endpoint") or event.get("relation") or event.get("event") or "",
+            "event": event.get("event") or "",
+            "status": event.get("status") or "",
+            "error": event.get("error") or "",
+            "ts": event.get("ts") or "",
+        }
+        for event in failed_events
+    ]
+    paid_total = int(paid_audit.get("paid_deliverable_count") or len(paid_jobs) or 0)
+    paid_observed_count = int(paid_audit.get("matched_roots") or len(paid_observed) or 0)
+    tracked_paid = len(tracker_roots & {str(job.get("tweet_id") or "") for job in paid_observed})
+    cascade_completed = len(cascade_roots & {str(job.get("tweet_id") or "") for job in paid_observed})
+    return {
+        "job_count": len(jobs),
+        "event_count": len(events),
+        "paid_job_count": len(paid_jobs),
+        "paid_terminal_job_count": len([job for job in paid_jobs if str(job.get("status") or "") in {"observed", "seeded_pending_metric_fetch", "fetch_failed", "invalid"}]),
+        "paid_root_coverage": round(paid_observed_count / paid_total, 3) if paid_total else 1.0,
+        "reply_page_coverage": round(len(reply_completed) / len(reply_attempted), 3) if reply_attempted else None,
+        "quote_page_coverage": round(len(quote_completed) / len(quote_attempted), 3) if quote_attempted else None,
+        "tracker_coverage": round(tracked_paid / len(paid_observed), 3) if paid_observed else None,
+        "cascade_coverage": round(cascade_completed / tracked_paid, 3) if tracked_paid else None,
+        "endpoint_failures": endpoint_failures[:50],
+    }
+
+
 def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
     config = load_json_object(config_path)
     identity = config.get("identity") if isinstance(config.get("identity"), dict) else {}
@@ -215,14 +280,7 @@ def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
     )[:20]
 
     paid_audit = paid_graph_audit(config_path, nodes_path)
-    paid_total = int(paid_audit.get("paid_deliverable_count") or 0)
-    collection_completeness = {
-        "paid_root_coverage": round(float(paid_audit.get("matched_roots") or 0) / paid_total, 3) if paid_total else 1.0,
-        "reply_page_coverage": None,
-        "quote_page_coverage": None,
-        "tracker_coverage": None,
-        "cascade_coverage": None,
-    }
+    collection_completeness = collection_diagnostics(config_path, paid_audit)
     risks: list[str] = []
     missing_handles = [
         handle for handle, row in per_watch.items()
@@ -248,6 +306,10 @@ def audit(config_path: Path, nodes_path: Path) -> dict[str, Any]:
         risks.append(f"paid graph readiness is {paid_audit['status']}: {paid_audit.get('status_counts', {})}")
         if paid_audit.get("failed_tweet_ids"):
             risks.append(f"paid root fetch failed: {', '.join(paid_audit['failed_tweet_ids'][:20])}")
+    for failure in collection_completeness.get("endpoint_failures") or []:
+        tweet_id = failure.get("tweet_id") or "unknown"
+        endpoint = failure.get("endpoint") or failure.get("event") or "unknown"
+        risks.append(f"collection endpoint failed: tweet={tweet_id} endpoint={endpoint}")
 
     return {
         "campaign_id": config.get("campaign_id"),
